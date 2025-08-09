@@ -1,0 +1,214 @@
+├── data_level0.bin      # The actual vector embeddings (4096 numbers per chunk)
+├── header.bin           # Metadata about vectors (chunk IDs, dimensions)
+├── length.bin           # Length information for each vector
+├── link_lists.bin       # Relationships between similar vectors
+└── chroma.sqlite3       # SQLite database storing text + metadata
+
+
+CREATE TABLE embeddings (
+    id TEXT PRIMARY KEY,
+    embedding BLOB,        -- The vector numbers
+    document TEXT,         -- The actual chunk text
+    metadata TEXT          -- JSON with page, source info
+);
+
+
+
+Thought for 4sExcellent question! Let me break down **exactly** what happens with PDF chunks, vector storage, and how the system finds relevant content for your question.
+
+## **What Gets Stored in ChromaDB**
+
+### **Step 1: PDF Processing Pipeline**
+
+When you upload `Resume_Raj_Mehta.pdf`, here's what happens:
+
+```python
+def load_pdf_chunks(pdf_path: str):
+    # 1. EXTRACT TEXT FROM PDF
+    loader = PyPDFLoader(pdf_path)
+    pages = loader.load()  # Gets raw text from each page
+
+    # 2. SPLIT INTO CHUNKS
+    splitter = CharacterTextSplitter(
+        chunk_size=500,      # Each chunk = 500 characters
+        chunk_overlap=50     # 50 characters overlap between chunks
+    )
+    chunks = splitter.split_documents(pages)
+    return chunks
+```
+
+### **Step 2: What Each Chunk Looks Like**
+
+Let's say Raj's resume contains this text:
+
+```plaintext
+Raj Mehta is a Senior Software Developer with 5 years of experience in full-stack development. He specializes in Python, JavaScript, React, and Node.js. His recent projects include building scalable web applications using Docker and AWS cloud services.
+
+Education:
+Bachelor of Science in Computer Science
+University of Technology, 2019
+GPA: 3.8/4.0
+
+Work Experience:
+Senior Developer at TechCorp (2021-2024)
+- Led development of microservices architecture
+- Implemented CI/CD pipelines using Jenkins
+- Managed team of 4 junior developers
+```
+
+**This gets split into chunks like:**
+
+**Chunk 1:**
+
+```plaintext
+"Raj Mehta is a Senior Software Developer with 5 years of experience in full-stack development. He specializes in Python, JavaScript, React, and Node.js. His recent projects include building scalable web applications using Docker and AWS cloud services. Education: Bachelor of Science in Computer Science University of Technology, 2019 GPA: 3.8/4.0"
+```
+
+**Chunk 2:**
+
+```plaintext
+"University of Technology, 2019 GPA: 3.8/4.0 Work Experience: Senior Developer at TechCorp (2021-2024) - Led development of microservices architecture - Implemented CI/CD pipelines using Jenkins - Managed team of 4 junior developers"
+```
+
+### **Step 3: Vector Embeddings Creation**
+
+```python
+class CohereEmbeddings:
+    def embed_documents(self, texts):
+        # Converts each text chunk into a vector of numbers
+        response = co.embed(texts=texts, model="embed-english-v2.0")
+        return response.embeddings
+```
+
+**Each chunk becomes a vector like:**
+
+```python
+# Chunk 1 becomes something like:
+[0.123, -0.456, 0.789, 0.234, -0.567, ...] # 4096 numbers
+
+# Chunk 2 becomes:
+[0.345, -0.123, 0.678, 0.456, -0.234, ...] # 4096 numbers
+```
+
+### **Step 4: Storage in ChromaDB**
+
+ChromaDB stores:
+
+```python
+{
+    "chunk_id_1": {
+        "text": "Raj Mehta is a Senior Software Developer...",
+        "embedding": [0.123, -0.456, 0.789, ...],
+        "metadata": {"page": 1, "source": "Resume_Raj_Mehta.pdf"}
+    },
+    "chunk_id_2": {
+        "text": "University of Technology, 2019 GPA: 3.8...",
+        "embedding": [0.345, -0.123, 0.678, ...],
+        "metadata": {"page": 1, "source": "Resume_Raj_Mehta.pdf"}
+    }
+}
+```
+
+## **How Question Matching Works**
+
+### **When User Asks: "What is Raj's educational background?"**
+
+**Step 1: Convert Question to Vector**
+
+```python
+def embed_query(self, text):
+    # "What is Raj's educational background?" becomes:
+    res = co.embed(texts=[text], model="embed-english-v2.0")
+    return res.embeddings[0]  # [0.234, -0.345, 0.567, ...]
+```
+
+**Step 2: Similarity Search**
+
+```python
+# In the main code:
+relevant_docs = vectorstore.similarity_search(user_question.strip(), k=3)
+```
+
+ChromaDB compares the question vector with all stored chunk vectors:
+
+```python
+# Calculates cosine similarity between vectors
+question_vector = [0.234, -0.345, 0.567, ...]
+
+chunk1_similarity = cosine_similarity(question_vector, chunk1_vector) # 0.65
+chunk2_similarity = cosine_similarity(question_vector, chunk2_vector) # 0.89  ← Higher!
+chunk3_similarity = cosine_similarity(question_vector, chunk3_vector) # 0.23
+```
+
+**Step 3: Return Top Matches**
+ChromaDB returns the top 3 most similar chunks:
+
+```python
+relevant_docs = [
+    Document(page_content="University of Technology, 2019 GPA: 3.8/4.0 Work Experience...", metadata={...}),
+    Document(page_content="Raj Mehta is a Senior Software Developer...", metadata={...}),
+    Document(page_content="Bachelor of Science in Computer Science...", metadata={...})
+]
+```
+
+## **What `doc.page_content` Actually Contains**
+
+```python
+# This line extracts the actual text from each relevant chunk:
+pdf_context = "\n\n".join([doc.page_content for doc in relevant_docs])
+```
+
+**For the education question, `pdf_context` becomes:**
+
+```plaintext
+University of Technology, 2019 GPA: 3.8/4.0 Work Experience: Senior Developer at TechCorp (2021-2024) - Led development of microservices architecture - Implemented CI/CD pipelines using Jenkins - Managed team of 4 junior developers
+
+Raj Mehta is a Senior Software Developer with 5 years of experience in full-stack development. He specializes in Python, JavaScript, React, and Node.js. His recent projects include building scalable web applications using Docker and AWS cloud services. Education: Bachelor of Science in Computer Science
+
+Bachelor of Science in Computer Science University of Technology, 2019 GPA: 3.8/4.0 Relevant Coursework: Data Structures, Algorithms, Database Systems, Software Engineering
+```
+
+## **Complete Context Building**
+
+The AI then receives:
+
+```python
+prompt = f"""You are a helpful PDF assistant. Answer based on PDF content and conversation history.
+
+PDF Content:
+University of Technology, 2019 GPA: 3.8/4.0 Work Experience: Senior Developer at TechCorp (2021-2024) - Led development of microservices architecture - Implemented CI/CD pipelines using Jenkins - Managed team of 4 junior developers
+
+Raj Mehta is a Senior Software Developer with 5 years of experience in full-stack development. He specializes in Python, JavaScript, React, and Node.js. His recent projects include building scalable web applications using Docker and AWS cloud services. Education: Bachelor of Science in Computer Science
+
+Bachelor of Science in Computer Science University of Technology, 2019 GPA: 3.8/4.0 Relevant Coursework: Data Structures, Algorithms, Database Systems, Software Engineering
+
+Previous conversation:
+User: What skills does Raj have?
+Assistant: Raj has strong technical skills including Python, JavaScript, React, Node.js...
+
+Current question: What is Raj's educational background?
+"""
+```
+
+## **Why This Works So Well**
+
+### **Semantic Understanding**
+
+- Question: "What is his education?"
+- Matches chunks containing: "Bachelor", "University", "GPA", "Computer Science"
+- Even if exact words don't match, semantic meaning does
+
+
+### **Multiple Relevant Chunks**
+
+- Gets 3 most relevant chunks (not just 1)
+- Provides comprehensive context
+- Handles information spread across multiple sections
+
+
+### **Overlap Handling**
+
+- 50-character overlap ensures no information is lost at chunk boundaries
+- Important sentences aren't cut in half
+
+
